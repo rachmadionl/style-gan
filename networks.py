@@ -75,8 +75,8 @@ class NoiseMod(nn.Module):
         """
             Injecting noise to G_synthesis networks as done by the paper.
         """
-        super(ApplyNoise, self).__init__()
-        self.weight = nn.Parameter(torch.zeros(n_channel))
+        super(NoiseMod, self).__init__()
+        self.weight = nn.Parameter(torch.zeros(n_channels))
 
     def forward(self, x, noise):
         if noise is None:
@@ -97,15 +97,15 @@ class StyleMod(nn.Module):
         style = self.linear(latent)  # [batch_size, n_channels*2]
         shape = [-1, 2, x.size(1), 1, 1]
         style = style.view(shape)  # [batch_size, 2, n_channels, 1, 1]
-        return x * style[:,0] + style[:,1]
+        return x * style[:, 0] + style[:, 1]
 
 
-class Upscale2d(nn.Module):
+class Upsampling(nn.Module):
     def __init__(self, factor=2, gain=1):
         """
             Upsampling layer used in G_synthesis network.
         """
-        super(Upscale2d, self).__init__()
+        super(Upsampling, self).__init__()
         self.factor = factor
         self.gain = gain
 
@@ -118,13 +118,44 @@ class Upscale2d(nn.Module):
         return x
 
 
-class Blur2d(nn.Module):
+class FusedUpsampling(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        """
+            StyleGAN uses two kinds of upsampling. One is where resolution
+            directly rescaled by a factor of 2, no interpolation whatsoever.
+            This method instead is using a 2-strided transpose conv2d.
+            FusedUpsampling is being used on higher resolution blocks.
+        """
+        super(FusedUpsampling, self).__init__()
+
+        w = torch.randn(in_channels, out_channels, kernel_size, kernel_size)
+        b = torch.zeros(out_channels)
+
+        fan_in = in_channels * kernel_size ** 2
+        self.gain = torch.sqrt(2 / fan_in)
+
+        self.w = nn.Parameter(w)
+        self.b = nn.Parameter(b)
+
+    def forward(self, x):
+        w = F.pad(self.w * self.gain, [1, 1, 1, 1])
+
+        # I stil don't understand what it exactly does and why
+        weight = (w[:, :, 1:, 1:]
+                  + w[:, :, :-1, 1:]
+                  + w[:, :, 1:, :-1]
+                  + w[:, :, :-1, :-1]) / 4
+
+        return F.conv_transpose2d(x, weight, self.b, stride=2)
+
+
+class Blur(nn.Module):
     def __init__(self, f=[1, 2, 1], use_normalize=True, use_flip=False, stride=1):
         """
             Low pass filtering which replaces the nearest-neighbor
             up/downsampling in both networks.
         """
-        super(Blur2d, self).__init__()
+        super(Blur, self).__init__()
         assert isinstance(f, list) or f is None,\
             f"kernel f must be python built-in list! got {type(f)} instead."
         self.stride = stride
@@ -172,4 +203,135 @@ class InstanceNorm(nn.Module):
         x = x - torch.mean(x, dim=(2, 3))
         tmp = torch.rsqrt(torch.mean(x**2, dim=(2, 3), keepdim=True) + self.epsilon)
         return x * tmp
+
+
+class ConstantInput(nn.Module):
+    def __init__(self, channel, size=4):
+        """
+            First input layer on G_Synthesis as in styleGAN paper. (The one
+            which has the shape of 4x512x512).
+        """
+        super(ConstantInput, self).__init__()
+
+        self.w = nn.Parameter(torch.randn(1, channel, size, size))
+
+    def forward(self, x):
+        batch = x.shape[0]
+        out = self.w.expand(batch, 1, 1, 1)
+
+        return out
+
+
+class AdaIn(nn.Module):
+    def __init__(self, n_channels, latent_size, use_wscale, use_noise,
+                 use_instance_norm, use_pixel_norm, use_style):
+        """
+            Layer epilogue where noise and/or styles are injected. Instance
+            normalization (PixelNorm/InstanceNorm) is apllied afterwards.
+        """
+        super(AdaIn, self).__init__()
+
+        self.noise = None
+        self.instance_norm = None
+        self.pixel_norm = None
+        self.style = None
+
+        if use_noise:
+            self.noise = NoiseMod(n_channels)
+
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2)
+
+        if use_instance_norm:
+            self.instance_norm = InstanceNorm()
+
+        if use_pixel_norm:
+            self.pixel_norm = PixelNorm()
+
+        if use_style:
+            self.style = StyleMod(latent_size, n_channels, use_wscale)
+
+    def forward(self, x, noise, latent):
+        # x = a or b is basically just set x to a if x is not None, else x is b
+        x = self.noise(x, noise) or x
+        x = self.lrelu(x)
+        x = self.instance_norm(x) or x
+        x = self.pixel_norm(x) or x
+        x = self.style(x, latent) or x
+
+        return x
+
+
+class GSynBlock(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 latent_size=512,
+                 kernel_size=3,
+                 use_wscale=True,
+                 use_noise=True,
+                 use_instance_norm=True,
+                 use_pixel_norm=False,
+                 use_style=True,
+                 initial=False,      # if initial = False, it'll be upsamling layer
+                 fused=False):
+        """
+            Generator Synthesis Network's building block which consists of:
+                --------------------------------------------------------
+               | ConstantInput/Upsampling -> AdaIn -> EqConv2d -> AdaIn |
+                --------------------------------------------------------
+        """
+        super(GSynBlock, self).__init__()
+
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2)
+
+        if initial:
+            self.conv1 = ConstantInput(in_channels)
+        else:
+            if fused:
+                self.conv1 = nn.Sequential(
+                    FusedUpsampling(in_channels, out_channels, kernel_size),
+                    Blur()
+                )
+            else:
+                self.conv1 = nn.Sequential(
+                    Upsampling(),
+                    EqConv2d(in_channels, out_channels, kernel_size),
+                    Blur()
+                )
+        self.adain1 = AdaIn(out_channels, latent_size, use_wscale, use_noise,
+                            use_instance_norm, use_pixel_norm, use_style)
+
+        self.conv2 = EqConv2d(out_channels, out_channels, kernel_size)
+        self.adain2 = AdaIn(out_channels, latent_size, use_wscale, use_noise,
+                            use_instance_norm, use_pixel_norm, use_style)
+
+    def forward(self, x, noise, latent):
+        x = self.conv1(x)
+        x = self.adain1(x, noise, latent)
+        x = self.conv2(x)
+        x = self.adain2(x, noise, latent)
+
+        return x
+
+
+class GSynNet(nn.Module):
+    def __init__(self, latent_size):
+        """
+            Generator Network
+        """
+        super(GSynNet, self).__init__()
+
+        self.progression = nn.ModuleList(
+            [
+                GSynBlock(512, 512, initial=True),                 # 4
+                GSynBlock(512, 512, initial=False),                # 8
+                GSynBlock(512, 512, initial=False),                # 16
+                GSynBlock(512, 512, initial=False),                # 32
+                GSynBlock(512, 256, initial=False),                # 64
+                GSynBlock(256, 128, initial=False, fused=True),    # 128
+                GSynBlock(128, 64, initial=False, fused=True),     # 256
+                GSynBlock(64, 32, initial=False, fused=True),      # 512
+                GSynBlock(32, 16, initial=False, fused=True),      # 1024
+            ]
+        )
 
