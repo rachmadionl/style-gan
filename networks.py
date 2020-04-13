@@ -3,10 +3,9 @@ import torch
 import os
 import torch.nn.functional as F
 import torch.nn as nn
+import random
 
-
-def InitWeightBias(in_channels, out_channels, use_wscale,
-                   use_bias, gain, lrmul):
+def InitWeightBias(in_channels, out_channels, use_wscale, use_bias, gain, lrmul):
     """
         Initializing Weight and Bias as according to StyleGAN paper.
     """
@@ -335,3 +334,95 @@ class GSynNet(nn.Module):
             ]
         )
 
+        self.to_rgb = nn.ModuleList(
+            [
+                EqConv2d(512, 3, 1),
+                EqConv2d(512, 3, 1),
+                EqConv2d(512, 3, 1),
+                EqConv2d(512, 3, 1),
+                EqConv2d(256, 3, 1),
+                EqConv2d(128, 3, 1),
+                EqConv2d(64, 3, 1),
+                EqConv2d(32, 3, 1),
+                EqConv2d(16, 3, 1)
+            ]
+        )
+
+    def forward(self, latent, noise, step, alpha=-1, mixing_range=(-1, -1)):
+        out = noise[0]
+
+        crossover = 0
+
+        if len(latent) < 2:
+            inject_index = [len(self.progression) + 1]
+        else:
+            inject_index = random.sample(list(range(step)), len(latent) - 1)
+
+        for i, (synthesis_block, to_rgb) in enumerate(zip(self.progression, self.to_rgb)):
+            if i > 0 and step > 0:
+                out_prev = out
+
+            # Style Mixing regularization
+            if mixing_range == (-1, -1):
+                if crossover < len(inject_index) and i > inject_index[crossover]:
+                    crossover = min(crossover + 1, len(latent))
+
+                latent_step = latent[crossover]
+
+            else:
+                if mixing_range[0] <= i <= mixing_range[1]:
+                    latent_step = latent[1]
+                else:
+                    latent_step = latent[0]
+
+            out = synthesis_block(out, noise[i], latent_step)
+
+            if i == step:
+                out = to_rgb(out)
+
+                if i > 0 and alpha <= 0 < 1:
+                    skip_rgb = self.to_rgb[i - 1](out_prev)
+                    skip_rgb = F.interpolate(skip_rgb, scale_factor=2, mode='nearest')
+                    out = (1 - alpha) * skip_rgb + alpha * out
+
+                break
+
+        return out
+
+
+class GStyle(nn.Module):
+    def __init__(self, dim_size=512, n_mlp=8):
+        """
+            Generator of StyleGAN
+        """
+        super().__init__()
+
+        self.synthesis = GSynNet(dim_size)
+
+        mapping = [PixelNorm()]
+        for i in range(n_mlp):
+            mapping.append(EqLinear(512, 512))
+            mapping.append(nn.LeakyReLU(0.2))
+
+        self.mapping = nn.Sequential(*mapping)
+
+    def forward(self, x, noise=None, step=0, alpha=-1, mixing_range=(-1, -1)):
+        latent = []
+
+        if type(x) not in (list, tuple):
+            x = [x]
+
+        for i in x:
+            latent.append(self.mapping(i))
+
+        return self.synthesis(latent, noise, step, alpha, mixing_range)
+
+
+class DBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding_size,
+                 kernel_size2=None, padding_size2=None, downsample=False,
+                 fused=False):
+        """
+            Building block for discriminator network
+        """
+        super(DBlock)
